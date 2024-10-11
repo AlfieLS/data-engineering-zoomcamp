@@ -1,26 +1,35 @@
 import os
-import logging
+from datetime import datetime
 
 from airflow import DAG
-from airflow.operators.bash import BashOperator
-from airflow.operators.python import PythonOperator
 from airflow.models import Variable
+from airflow.operators.python import PythonOperator
 
 from google.cloud import storage
 from airflow.providers.google.cloud.operators.bigquery import BigQueryCreateExternalTableOperator
-import pyarrow.csv as pv
-import pyarrow.parquet as pq
 
 PROJECT_ID = Variable.get("GCP_PROJECT_ID")
 BUCKET = Variable.get("GCP_GCS_BUCKET")
-
-dataset_file = "yellow_tripdata_2021-01.parquet"
-dataset_url = f"https://d37ci6vzurychx.cloudfront.net/trip-data/{dataset_file}"
-path_to_local_home = os.environ.get("AIRFLOW_HOME", "/opt/airflow/")
 BIGQUERY_DATASET = Variable.get("BIGQUERY_DATASET", default_var='trips_data_all')
 
+date = '{{ execution_date.strftime("%Y-%m") }}'
+file_name = f"fhv_tripdata_{date}.parquet"
+path_to_local_home = os.environ.get("AIRFLOW_HOME", "/opt/airflow/")
+url = f"https://d37ci6vzurychx.cloudfront.net/trip-data/{file_name}"
 
-# NOTE: takes 20 mins, at an upload speed of 800kbps. Faster if your internet has a better upload speed
+def download_dataset(url, local_file):
+    """
+    Ref: https://cloud.google.com/storage/docs/uploading-objects#storage-upload-object-python
+    :param url: URL to download the file
+    :param local_file: source path & file-name
+    :return:
+    """
+    import requests
+    print(f"Downloading {url} to {local_file}")
+    response = requests.get(url)
+    with open(local_file, 'wb') as f:
+        f.write(response.content)
+
 def upload_to_gcs(bucket, object_name, local_file):
     """
     Ref: https://cloud.google.com/storage/docs/uploading-objects#storage-upload-object-python
@@ -41,37 +50,29 @@ def upload_to_gcs(bucket, object_name, local_file):
     blob = bucket.blob(object_name)
     blob.upload_from_filename(local_file)
 
-
-default_args = {
-    "owner": "airflow",
-    "start_date": None,
-    "depends_on_past": False,
-    "retries": 1,
-}
-
-# NOTE: DAG declaration - using a Context Manager (an implicit way)
 with DAG(
-    dag_id="data_ingestion_gcs_dag",
-    schedule_interval=None,
-    default_args=default_args,
-    catchup=False,
-    max_active_runs=1,
-    tags=['dtc-de'],
+    dag_id="fhv_data_to_gcs",
+    start_date=datetime(2019, 1, 1),
+    end_date=datetime(2019, 12, 2),
+    schedule_interval="@monthly"
 ) as dag:
 
-    download_dataset_task = BashOperator(
+    download_dataset_task = PythonOperator(
         task_id="download_dataset_task",
-        bash_command=f"curl -sSL {dataset_url} > {path_to_local_home}/{dataset_file}"
+        python_callable=download_dataset,
+        op_kwargs={
+            "url": url,
+            "local_file": f"{path_to_local_home}/{file_name}"
+        },
     )
 
-    # TODO: Homework - research and try XCOM to communicate output values between 2 tasks/operators
-    local_to_gcs_task = PythonOperator(
-        task_id="local_to_gcs_task",
+    upload_to_gcs_task = PythonOperator(
+        task_id="upload_to_gcs_task",
         python_callable=upload_to_gcs,
         op_kwargs={
             "bucket": BUCKET,
-            "object_name": f"raw/{dataset_file}",
-            "local_file": f"{path_to_local_home}/{dataset_file}",
+            "object_name": f"raw/{file_name}",
+            "local_file": f"{path_to_local_home}/{file_name}"
         },
     )
 
@@ -81,13 +82,13 @@ with DAG(
             "tableReference": {
                 "projectId": PROJECT_ID,
                 "datasetId": BIGQUERY_DATASET,
-                "tableId": "external_table",
+                "tableId": f"external_table_fhv_{date}",
             },
             "externalDataConfiguration": {
                 "sourceFormat": "PARQUET",
-                "sourceUris": [f"gs://{BUCKET}/raw/{dataset_file}"],
+                "sourceUris": [f"gs://{BUCKET}/raw/{file_name}"],
             },
         },
     )
 
-    download_dataset_task >> local_to_gcs_task >> bigquery_external_table_task
+    download_dataset_task >> upload_to_gcs_task >> bigquery_external_table_task
